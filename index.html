@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="robots" content="noindex, nofollow">
+<title>Pink Eis Canyon</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #e9c3d2; font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; color: #5a2a40; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+           background: rgba(244, 208, 222, .72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); text-align: center; padding: 24px; cursor: pointer; }
+  #start h1 { margin: 0; font-size: clamp(28px, 6vw, 56px); letter-spacing: .02em; font-weight: 700; }
+  #start p { margin: 0; max-width: 34em; line-height: 1.45; font-size: 16px; }
+  #start button { font: inherit; font-size: 17px; font-weight: 600; padding: 13px 30px; border-radius: 999px; border: 0; background: #e2437f; color: #fff; cursor: pointer; }
+  #start button[disabled] { background: #c9a3b3; cursor: default; }
+  #hud { position: fixed; left: 14px; bottom: 12px; font-size: 13px; background: rgba(255, 255, 255, .55); padding: 6px 12px; border-radius: 999px; pointer-events: none; }
+  #neu { position: fixed; right: 14px; bottom: 12px; font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 999px; border: 0; background: rgba(255, 255, 255, .7); color: #5a2a40; cursor: pointer; }
+  #kreuz { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px; border-radius: 50%; background: rgba(255, 255, 255, .7); pointer-events: none; }
+  .stick { position: fixed; width: 110px; height: 110px; margin: -55px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, .7); pointer-events: none; display: none; }
+  .stick i { position: absolute; left: 50%; top: 50%; width: 44px; height: 44px; margin: -22px; border-radius: 50%; background: rgba(255, 255, 255, .75); }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="kreuz"></div>
+<div class="stick" id="stick"><i></i></div>
+<div id="hud">Lädt</div>
+<button id="neu">Zurück zum Start</button>
+<div id="start">
+  <h1>Pink Eis Canyon</h1>
+  <p id="hinweis">Am Rechner: klicken, dann mit W A S D laufen und mit der Maus umsehen (oder mit gedrückter Maustaste ziehen). Shift rennt, R setzt dich an den Start.<br>Am Handy: links wischen zum Laufen, rechts wischen zum Umsehen.</p>
+  <button id="los" disabled>Lädt</button>
+</div>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+const canvas = document.getElementById("c");
+const hud = document.getElementById("hud"), startEl = document.getElementById("start"), los = document.getElementById("los");
+const touch = matchMedia("(pointer: coarse)").matches;
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NoToneMapping;
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xb9aebb, 12, 70);
+const cam = new THREE.PerspectiveCamera(46.4, 1, 0.05, 1200);
+cam.rotation.order = "YXZ";
+
+const START = { x: 0, z: 0, yaw: 0, pitch: 8 * Math.PI / 180 };
+const AUGE = 1.55, HOF = -0.25;          // Hof vor der Treppe liegt bei -0.25 m, das Auge startet damit auf 1,30 m wie die Kamera des Bildes
+const pos = { x: START.x, z: START.z, y: HOF }; let yaw = START.yaw, pitch = START.pitch;
+
+// ---------- Daten laden ----------
+const [meta, tiefeBuf, gangBuf] = await Promise.all([
+  fetch("daten/meta.json").then(r => r.json()),
+  fetch("daten/tiefe.bin").then(r => r.arrayBuffer()),
+  fetch("daten/gang.bin").then(r => r.arrayBuffer()),
+]);
+const Q = new Uint16Array(tiefeBuf), G = new Uint8Array(gangBuf);
+const W = meta.w, H = meta.h, S = touch ? 2 : 1;        // am Handy jedes zweite Rasterfeld
+const w = Math.floor((W - 1) / S) + 1, h = Math.floor((H - 1) / S) + 1;
+const cp = Math.cos(meta.pitch * Math.PI / 180), sp = Math.sin(meta.pitch * Math.PI / 180);
+const iz0 = 1 / meta.zmax, iz1 = 1 / meta.zmin;
+const P = new Float32Array(w * h * 3), UV = new Float32Array(w * h * 2), ok = new Uint8Array(w * h), ZT = new Float32Array(w * h);
+function punkt(j, i, z, out, o) {                          // Rasterpunkt entlang seines Kamerastrahls in die Tiefe z
+  const xc = (j + 0.5 - W / 2) / meta.fpx, yc = -(i + 0.5 - H / 2) / meta.fpx;
+  const px = xc * z, py = yc * z;
+  out[o] = px; out[o + 1] = py * cp + z * sp + meta.camz; out[o + 2] = -(z * cp - py * sp);
+}
+for (let a = 0; a < h; a++) for (let b = 0; b < w; b++) {
+  const i = a * S, j = b * S, q = Q[i * W + j], n = a * w + b;
+  UV[n * 2] = (j + 0.5) / W; UV[n * 2 + 1] = 1 - (i + 0.5) / H;
+  if (!q) continue;
+  ok[n] = 1;
+  ZT[n] = 1 / (iz0 + (q - 1) / 65534 * (iz1 - iz0));
+  punkt(j, i, ZT[n], P, n * 3);
+}
+const SPRUNG = 1.22;
+const idx = new Uint32Array((w - 1) * (h - 1) * 6), behalten = new Uint8Array(w * h); let k = 0;
+for (let a = 0; a < h - 1; a++) for (let b = 0; b < w - 1; b++) {
+  const n = a * w + b;
+  if (!(ok[n] && ok[n + 1] && ok[n + w] && ok[n + w + 1])) continue;
+  const za = ZT[n], zb = ZT[n + 1], zc = ZT[n + w], zd = ZT[n + w + 1];      // Tiefensprung: keine Flaeche entlang des Sichtstrahls spannen
+  if (Math.max(za, zb, zc, zd) / Math.min(za, zb, zc, zd) > SPRUNG) continue;
+  behalten[n] = 1;
+  idx[k++] = n; idx[k++] = n + w; idx[k++] = n + 1; idx[k++] = n + 1; idx[k++] = n + w; idx[k++] = n + w + 1;
+}
+const geo = new THREE.BufferGeometry();
+geo.setAttribute("position", new THREE.BufferAttribute(P, 3));
+geo.setAttribute("uv", new THREE.BufferAttribute(UV, 2));
+geo.setIndex(new THREE.BufferAttribute(idx.subarray(0, k), 1));
+geo.computeBoundingSphere();
+const tex = await new THREE.TextureLoader().loadAsync("daten/farbe.jpg");
+tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+const matRelief = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
+scene.add(new THREE.Mesh(geo, matRelief));
+
+// ---------- Fels hinter den Sichtkanten: weitergedachtes Gelaende als Faecher aus Richtung und Entfernung ----------
+const F = meta.fels;
+const [fh, fc] = await Promise.all([fetch("daten/fels_h.bin").then(r => r.arrayBuffer()), fetch("daten/fels_c.bin").then(r => r.arrayBuffer())]);
+const FH = new Float32Array(fh), FC = new Uint8Array(fc);
+const fp = new Float32Array(F.nt * F.nr * 3), ft = new Float32Array(F.nt * F.nr * 4), fi = new Uint32Array((F.nt - 1) * (F.nr - 1) * 6);
+for (let t = 0; t < F.nt; t++) { const th = F.t0 + (t + 0.5) * F.dth, st = Math.sin(th), ct = Math.cos(th);
+  for (let r = 0; r < F.nr; r++) { const n = t * F.nr + r, rho = F.r0 + (r + 0.5) * F.dr;
+    fp[n * 3] = rho * st; fp[n * 3 + 1] = FH[n]; fp[n * 3 + 2] = -rho * ct;
+    ft[n * 4] = FC[n * 4] / 255; ft[n * 4 + 1] = FC[n * 4 + 1] / 255; ft[n * 4 + 2] = FC[n * 4 + 2] / 255; ft[n * 4 + 3] = FC[n * 4 + 3] / 255; } }
+{ let q = 0; for (let t = 0; t < F.nt - 1; t++) for (let r = 0; r < F.nr - 1; r++) { const n = t * F.nr + r;
+    fi[q++] = n; fi[q++] = n + 1; fi[q++] = n + F.nr; fi[q++] = n + 1; fi[q++] = n + F.nr + 1; fi[q++] = n + F.nr; } }
+const felsGeo = new THREE.BufferGeometry();
+felsGeo.setAttribute("position", new THREE.BufferAttribute(fp, 3)); felsGeo.setAttribute("ton", new THREE.BufferAttribute(ft, 4));
+felsGeo.setIndex(new THREE.BufferAttribute(fi, 1)); felsGeo.computeVertexNormals(); felsGeo.computeBoundingSphere();
+const eisTex = await new THREE.TextureLoader().loadAsync("daten/eis.jpg");
+eisTex.wrapS = eisTex.wrapT = THREE.RepeatWrapping; eisTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+const matFels = new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  uniforms: { eis: { value: eisTex }, nebel: { value: new THREE.Color(0xb9aebb).convertLinearToSRGB() } },
+  vertexShader: `attribute vec4 ton; varying vec4 vT; varying vec3 vW, vN;
+    void main() { vec4 wp = modelMatrix * vec4(position, 1.0); vW = wp.xyz; vN = normalize(mat3(modelMatrix) * normal); vT = ton; gl_Position = projectionMatrix * viewMatrix * wp; }`,
+  fragmentShader: `uniform sampler2D eis; uniform vec3 nebel; varying vec4 vT; varying vec3 vW, vN;
+    vec3 drei(vec3 p, vec3 n, float s) { vec3 a = pow(abs(n), vec3(4.0)); a /= (a.x + a.y + a.z);
+      return texture2D(eis, p.zy * s).rgb * a.x + texture2D(eis, p.xz * s).rgb * a.y + texture2D(eis, p.xy * s).rgb * a.z; }
+    void main() { vec3 n = normalize(vN); float ny = abs(n.y);
+      vec3 d = (drei(vW, n, 0.2) * 0.4 + drei(vW, n, 0.057) * 0.25 + drei(vW + 3.7, n, 0.9) * 0.35) / vec3(0.894, 0.659, 0.722);      // Eistextur im Raum, als Abweichung vom Mittel
+      vec3 col = vT.rgb * clamp(pow(d, vec3(1.6)), 0.6, 1.4);
+      col = mix(col * vec3(0.95, 0.85, 0.89), col * vec3(1.03, 1.05, 1.04), vT.a);                      // Mulden satter und dunkler, Kuppen heller
+      float welle = sin(vW.x * 0.7 + vW.z * 0.9) * 2.0;
+      float lage = vW.y * 9.0 + welle; float linie = smoothstep(0.75, 1.0, sin(lage)) - 0.6 * smoothstep(0.7, 1.0, sin(lage * 2.7 + 1.3));
+      col *= (0.86 + 0.14 * ny) * (1.0 + 0.07 * linie * (1.0 - ny));                                   // weiches Himmelslicht, feine Schichtlinien an steilen Flaechen                           // weiches Himmelslicht, feine Schichten
+      float schnee = smoothstep(0.80, 0.94, n.y);
+      col = mix(col, vec3(0.855, 0.752, 0.835) * (0.96 + 0.04 * d.g), schnee * 0.9);                  // Schnee auf den flachen Stellen
+      float f = clamp((distance(cameraPosition, vW) - 12.0) / 58.0, 0.0, 1.0);
+      col = pow(mix(pow(col, vec3(2.2)), pow(nebel, vec3(2.2)), f), vec3(1.0 / 2.2));
+      gl_FragColor = vec4(col, 1.0); }` });
+scene.add(new THREE.Mesh(felsGeo, matFels));
+
+// ---------- Felskoerper: das Relief wird nach hinten aufgeblasen. An der Sichtkante Dicke null, zur Mitte hin rund und dick ----------
+const INF = 1e9, DK = new Float32Array(w * h).fill(INF);
+const istFern = (a, b) => !ok[b] || ZT[b] > ZT[a] * SPRUNG;             // b liegt deutlich hinter a oder ist Himmel: a ist Sichtkante
+const nah = (a, b) => ok[b] && ZT[b] < ZT[a] * SPRUNG && ZT[a] < ZT[b] * SPRUNG;   // gleiche Flaeche
+for (let a = 0; a < h; a++) for (let b = 0; b < w; b++) { const n = a * w + b; if (!ok[n]) continue;
+  const z1 = a > 0 && b > 0 && behalten[n - w - 1], z2 = a > 0 && b < w - 1 && behalten[n - w], z3 = a < h - 1 && b > 0 && behalten[n - 1], z4 = a < h - 1 && b < w - 1 && behalten[n];
+  if (!(z1 && z2 && z3 && z4)) DK[n] = 0; }                           // jeder Rand der Flaeche: dort treffen sich Vorder und Rueckseite
+for (let runde = 0; runde < 3; runde++) {                           // Abstand zur Sichtkante, nur innerhalb derselben Flaeche
+  for (let a = 0; a < h; a++) for (let b = 0; b < w; b++) { const n = a * w + b; if (!ok[n]) continue; let d = DK[n];
+    if (b > 0 && nah(n, n - 1)) d = Math.min(d, DK[n - 1] + 1); if (a > 0 && nah(n, n - w)) d = Math.min(d, DK[n - w] + 1);
+    if (a > 0 && b > 0 && nah(n, n - w - 1)) d = Math.min(d, DK[n - w - 1] + 1.414); if (a > 0 && b < w - 1 && nah(n, n - w + 1)) d = Math.min(d, DK[n - w + 1] + 1.414); DK[n] = d; }
+  for (let a = h - 1; a >= 0; a--) for (let b = w - 1; b >= 0; b--) { const n = a * w + b; if (!ok[n]) continue; let d = DK[n];
+    if (b < w - 1 && nah(n, n + 1)) d = Math.min(d, DK[n + 1] + 1); if (a < h - 1 && nah(n, n + w)) d = Math.min(d, DK[n + w] + 1);
+    if (a < h - 1 && b < w - 1 && nah(n, n + w + 1)) d = Math.min(d, DK[n + w + 1] + 1.414); if (a < h - 1 && b > 0 && nah(n, n + w - 1)) d = Math.min(d, DK[n + w - 1] + 1.414); DK[n] = d; }
+}
+function unruhe(x, y, z) { const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453; return s - Math.floor(s); }
+function weich(x, y, z, g) { x /= g; y /= g; z /= g; const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z); let tx = x - xi, ty = y - yi, tz = z - zi;
+  tx = tx * tx * (3 - 2 * tx); ty = ty * ty * (3 - 2 * ty); tz = tz * tz * (3 - 2 * tz); let r = 0;
+  for (let c = 0; c < 8; c++) { const ox = c & 1, oy = (c >> 1) & 1, oz = (c >> 2) & 1;
+    r += unruhe(xi + ox, yi + oy, zi + oz) * (ox ? tx : 1 - tx) * (oy ? ty : 1 - ty) * (oz ? tz : 1 - tz); } return r; }
+// Farbton der Rueckseiten: stark weichgezeichnetes Licht aus dem Render
+const klein = document.createElement("canvas"); klein.width = 48; klein.height = 60;
+const kc = klein.getContext("2d", { willReadFrequently: true }); kc.drawImage(tex.image, 0, 0, 48, 60); const kd = kc.getImageData(0, 0, 48, 60).data;
+const RADIUS = 3.6, RP = new Float32Array(w * h * 3), RT = new Float32Array(w * h * 4);
+for (let a = 0; a < h; a++) for (let b = 0; b < w; b++) { const n = a * w + b; if (!ok[n]) continue;
+  const z = ZT[n], r = Math.min(DK[n] * S * z / meta.fpx, RADIUS);                 // Abstand zur Kante in Metern
+  let dick = 2 * Math.sqrt(r * (2 * RADIUS - r));                                    // Kreisprofil: an der Kante rund, innen bis 7 m
+  dick *= 0.7 + 0.6 * weich(P[n * 3], P[n * 3 + 1], P[n * 3 + 2], 2.5);
+  const stufe = P[n * 3 + 1] / 0.9 + weich(P[n * 3], 0, P[n * 3 + 2], 7) * 1.5;    // Schichten auch auf der Rueckseite
+  dick *= 0.9 + 0.2 * Math.abs(stufe - Math.floor(stufe) - 0.5);
+  punkt(b * S, a * S, z + dick, RP, n * 3);
+  const u = Math.min(47, Math.floor(b / w * 48)), v = Math.min(59, Math.floor(a / h * 60)), q = (v * 48 + u) * 4;
+  RT[n * 4] = kd[q] / 255; RT[n * 4 + 1] = kd[q + 1] / 255; RT[n * 4 + 2] = kd[q + 2] / 255; RT[n * 4 + 3] = 0.45; }
+const rIdx = [];
+for (let a = 0; a < h - 1; a++) for (let b = 0; b < w - 1; b++) { const n = a * w + b; if (!behalten[n]) continue;
+  rIdx.push(n, n + 1, n + w, n + 1, n + w + 1, n + w); }
+const NV = w * h;
+const rueckGeo = new THREE.BufferGeometry();
+rueckGeo.setAttribute("position", new THREE.BufferAttribute(RP, 3)); rueckGeo.setAttribute("ton", new THREE.BufferAttribute(RT, 4));
+rueckGeo.setIndex(new THREE.BufferAttribute(new Uint32Array(rIdx), 1)); rueckGeo.computeVertexNormals();
+{ const nr = rueckGeo.attributes.normal.array;                        // Normalen nach aussen: weg von der Kamera des Bildes
+  for (let n = 0; n < NV; n++) { const dx = RP[n * 3], dy = RP[n * 3 + 1] - meta.camz, dz = RP[n * 3 + 2];
+    if (nr[n * 3] * dx + nr[n * 3 + 1] * dy + nr[n * 3 + 2] * dz < 0) { nr[n * 3] *= -1; nr[n * 3 + 1] *= -1; nr[n * 3 + 2] *= -1; } } }
+rueckGeo.computeBoundingSphere();
+scene.add(new THREE.Mesh(rueckGeo, matFels));
+
+// ---------- Seiten schliessen: der Canyon wird am linken und rechten Bildrand gespiegelt fortgesetzt ----------
+function spiegel(xc) {                                       // Spiegelebene = Ebene durch Kamera und Randstrahlen
+  const n = new THREE.Vector3(1, -xc * sp, xc * cp).normalize(), c = meta.camz;
+  const m = new THREE.Matrix4().set(
+    1 - 2 * n.x * n.x, -2 * n.x * n.y, -2 * n.x * n.z, 2 * n.x * n.y * c,
+    -2 * n.y * n.x, 1 - 2 * n.y * n.y, -2 * n.y * n.z, 2 * n.y * n.y * c,
+    -2 * n.z * n.x, -2 * n.z * n.y, 1 - 2 * n.z * n.z, 2 * n.z * n.y * c,
+    0, 0, 0, 1);
+  for (const [g_, m_] of [[geo, matRelief], [felsGeo, matFels], [rueckGeo, matFels]]) { const mesh = new THREE.Mesh(g_, m_); mesh.matrixAutoUpdate = false; mesh.matrix.copy(m); mesh.frustumCulled = false; scene.add(mesh); }
+}
+spiegel((0.5 - W / 2) / meta.fpx); spiegel((W - 0.5 - W / 2) / meta.fpx);
+
+// ---------- Boden, ferne Waende, Himmel ----------
+const boden = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.MeshBasicMaterial({ color: 0xd9c0d6 }));
+boden.rotation.x = -Math.PI / 2; boden.position.y = HOF; scene.add(boden);
+const zyl = new THREE.CylinderGeometry(95, 95, 16, 64, 1, true);
+{ const c = new Float32Array(zyl.attributes.position.count * 3), unten = new THREE.Color(0xe6b4c8), oben = new THREE.Color(0xdcdfea), t = new THREE.Color();
+  for (let i = 0; i < zyl.attributes.position.count; i++) { t.lerpColors(unten, oben, (zyl.attributes.position.getY(i) + 8) / 16); c.set([t.r, t.g, t.b], i * 3); }
+  zyl.setAttribute("color", new THREE.BufferAttribute(c, 3)); }
+const fern = new THREE.Mesh(zyl, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false }));
+fern.position.set(0, 8 + HOF, -15); scene.add(fern);
+const himmelTex = await new THREE.TextureLoader().loadAsync("daten/himmel.jpg");
+himmelTex.colorSpace = THREE.SRGBColorSpace; himmelTex.wrapS = THREE.MirroredRepeatWrapping; himmelTex.repeat.set(2, 1); himmelTex.offset.set(0.25, 0);
+const himmel = new THREE.Mesh(new THREE.SphereGeometry(900, 48, 24, 0, Math.PI * 2, 0, Math.PI * 0.62),
+  new THREE.MeshBasicMaterial({ map: himmelTex, side: THREE.BackSide, fog: false, depthWrite: false }));
+himmel.renderOrder = -1; scene.add(himmel);
+
+// ---------- Figur ----------
+scene.add(new THREE.HemisphereLight(0xffffff, 0xf2b6cc, 2.6));
+const sonne = new THREE.DirectionalLight(0xfff4ea, 1.1); sonne.position.set(-6.5, 6, 1.5); scene.add(sonne);
+new GLTFLoader().load("daten/figur.glb", g => scene.add(g.scene));
+
+// ---------- Lauffläche: Höhenraster aus Schnee und Stufen ----------
+const ZELLE = 0.1; let gx0 = 1e9, gx1 = -1e9, gz0 = 1e9, gz1 = -1e9;
+for (let a = 0; a < h; a++) for (let b = 0; b < w; b++) {
+  const n = a * w + b; if (!ok[n] || !G[a * S * W + b * S]) continue;
+  gx0 = Math.min(gx0, P[n * 3]); gx1 = Math.max(gx1, P[n * 3]); gz0 = Math.min(gz0, P[n * 3 + 2]); gz1 = Math.max(gz1, P[n * 3 + 2]);
+}
+const gw = Math.ceil((gx1 - gx0) / ZELLE) + 3, gh = Math.ceil((gz1 - gz0) / ZELLE) + 3;
+let hoehe = new Float32Array(gw * gh).fill(NaN);
+for (let a = 0; a < h; a++) for (let b = 0; b < w; b++) {
+  const n = a * w + b; if (!ok[n] || !G[a * S * W + b * S]) continue;
+  const c = Math.round((P[n * 3] - gx0) / ZELLE) + 1 + (Math.round((P[n * 3 + 2] - gz0) / ZELLE) + 1) * gw;
+  if (!(hoehe[c] >= P[n * 3 + 1])) hoehe[c] = P[n * 3 + 1];
+}
+for (let runde = 0; runde < 5; runde++) {                   // Luecken zwischen den Rasterpunkten schliessen
+  const neu = hoehe.slice();
+  for (let z = 1; z < gh - 1; z++) for (let x = 1; x < gw - 1; x++) {
+    const c = x + z * gw; if (!isNaN(hoehe[c])) continue;
+    let s = 0, m = 0;
+    for (const d of [-1, 1, -gw, gw, -gw - 1, -gw + 1, gw - 1, gw + 1]) if (!isNaN(hoehe[c + d])) { s += hoehe[c + d]; m++; }
+    if (m >= 2) neu[c] = s / m;
+  }
+  hoehe = neu;
+}
+function grund(x, z) {
+  const fx = (x - gx0) / ZELLE + 1, fz = (z - gz0) / ZELLE + 1, ix = Math.floor(fx), iz = Math.floor(fz);
+  if (ix >= 0 && iz >= 0 && ix < gw - 1 && iz < gh - 1) {
+    const a = hoehe[ix + iz * gw], b = hoehe[ix + 1 + iz * gw], c = hoehe[ix + (iz + 1) * gw], d = hoehe[ix + 1 + (iz + 1) * gw];
+    if (!isNaN(a) && !isNaN(b) && !isNaN(c) && !isNaN(d)) { const tx = fx - ix, tz = fz - iz; return (a * (1 - tx) + b * tx) * (1 - tz) + (c * (1 - tx) + d * tx) * tz; }
+  }
+  if (z > gz1 - 0.6 && z < 9 && Math.abs(x - 1.2) < 7.5) return HOF;     // Hof vor der Treppe
+  return NaN;
+}
+
+// ---------- Steuerung ----------
+const taste = {}; let laeuft = false, gesperrt = false;
+function sperren() { try { const r = canvas.requestPointerLock?.(); if (r && r.catch) r.catch(() => {}); } catch (e) {} }   // ohne Sperre geht Umsehen per Ziehen
+addEventListener("keydown", e => { taste[e.code] = true; if (e.code === "KeyR") zurueck(); });
+addEventListener("keyup", e => { taste[e.code] = false; });
+function zurueck() { pos.x = START.x; pos.z = START.z; pos.y = HOF; yaw = START.yaw; pitch = START.pitch; }
+document.getElementById("neu").onclick = zurueck;
+function schau(dx, dy, f) { yaw -= dx * f; pitch = Math.max(-1.35, Math.min(1.35, pitch - dy * f)); }
+startEl.onclick = () => { if (los.disabled) return; startEl.style.display = "none"; laeuft = true; if (!touch) sperren(); };
+canvas.addEventListener("click", () => { if (laeuft && !touch && !gesperrt) sperren(); });
+document.addEventListener("pointerlockchange", () => { gesperrt = document.pointerLockElement === canvas; });
+let zieht = false;
+canvas.addEventListener("mousedown", () => { zieht = true; }); addEventListener("mouseup", () => { zieht = false; });
+addEventListener("mousemove", e => { if (gesperrt) schau(e.movementX, e.movementY, 0.0022); else if (zieht && laeuft) schau(-e.movementX, -e.movementY, 0.004); });
+const stick = document.getElementById("stick"), knopf = stick.firstElementChild; let gehe = null, blick = null; const lauf = { x: 0, y: 0 };
+canvas.addEventListener("touchstart", e => { e.preventDefault(); for (const t of e.changedTouches) {
+  if (t.clientX < innerWidth / 2 && !gehe) { gehe = { id: t.identifier, x: t.clientX, y: t.clientY }; stick.style.display = "block"; stick.style.left = t.clientX + "px"; stick.style.top = t.clientY + "px"; }
+  else if (!blick) blick = { id: t.identifier, x: t.clientX, y: t.clientY }; } }, { passive: false });
+canvas.addEventListener("touchmove", e => { e.preventDefault(); for (const t of e.changedTouches) {
+  if (gehe && t.identifier === gehe.id) { let dx = (t.clientX - gehe.x) / 50, dy = (t.clientY - gehe.y) / 50; const l = Math.hypot(dx, dy); if (l > 1) { dx /= l; dy /= l; }
+    lauf.x = dx; lauf.y = dy; knopf.style.transform = `translate(${dx * 33}px, ${dy * 33}px)`; }
+  if (blick && t.identifier === blick.id) { schau(-(t.clientX - blick.x), -(t.clientY - blick.y), -0.005); blick.x = t.clientX; blick.y = t.clientY; } } }, { passive: false });
+const los_ = e => { for (const t of e.changedTouches) { if (gehe && t.identifier === gehe.id) { gehe = null; lauf.x = lauf.y = 0; stick.style.display = "none"; knopf.style.transform = ""; } if (blick && t.identifier === blick.id) blick = null; } };
+canvas.addEventListener("touchend", los_); canvas.addEventListener("touchcancel", los_);
+
+function groesse() { renderer.setSize(innerWidth, innerHeight, false); cam.aspect = innerWidth / innerHeight;
+  cam.fov = cam.aspect >= 0.8 ? 46.4 : 2 * Math.atan(Math.tan(18.9 * Math.PI / 180) / cam.aspect) * 180 / Math.PI;   // Hochformat: Bildbreite der Vorlage halten
+  cam.updateProjectionMatrix(); }
+addEventListener("resize", groesse); groesse();
+
+let zuletzt = performance.now();
+function bild(jetzt) {
+  const dt = Math.min(0.05, (jetzt - zuletzt) / 1000); zuletzt = jetzt;
+  if (laeuft) {
+    let vx = lauf.x + (taste.KeyD || taste.ArrowRight ? 1 : 0) - (taste.KeyA || taste.ArrowLeft ? 1 : 0);
+    let vz = lauf.y + (taste.KeyS || taste.ArrowDown ? 1 : 0) - (taste.KeyW || taste.ArrowUp ? 1 : 0);
+    const l = Math.hypot(vx, vz);
+    if (l > 0.01) {
+      const tempo = (taste.ShiftLeft || taste.ShiftRight ? 5.0 : 2.4) * dt / Math.max(1, l);
+      const dx = (vx * Math.cos(yaw) + vz * Math.sin(yaw)) * tempo, dz = (-vx * Math.sin(yaw) + vz * Math.cos(yaw)) * tempo;
+      const hier = grund(pos.x, pos.z);
+      for (const [nx, nz] of [[pos.x + dx, pos.z + dz], [pos.x + dx, pos.z], [pos.x, pos.z + dz]]) {      // an Waenden entlang gleiten
+        const g = grund(nx, nz);
+        if (!isNaN(g) && (isNaN(hier) || g - hier < 0.5)) { pos.x = nx; pos.z = nz; break; }
+      }
+    }
+    const g = grund(pos.x, pos.z); if (!isNaN(g)) pos.y += (g - pos.y) * Math.min(1, 12 * dt);
+  }
+  cam.position.set(pos.x, pos.y + AUGE, pos.z); cam.rotation.set(pitch, yaw, 0);
+  himmel.position.copy(cam.position);
+  renderer.render(scene, cam);
+  requestAnimationFrame(bild);
+}
+window.__canyon = { pos, grund, setze: (x, z, y, p) => { pos.x = x; pos.z = z; const g = grund(x, z); if (!isNaN(g)) pos.y = g; if (y !== undefined) yaw = y; if (p !== undefined) pitch = p; } };
+hud.textContent = touch ? "Links laufen, rechts umsehen" : "W A S D laufen · Maus umsehen · Shift rennen · R Start";
+los.disabled = false; los.textContent = "Loslaufen";
+requestAnimationFrame(bild);
+</script>
+</body>
+</html>
